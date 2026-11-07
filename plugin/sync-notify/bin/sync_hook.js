@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Sync notify hooks (prototype 0.2). Node >= 18, no npm dependencies.
+// Sync notify hooks (prototype 0.4). Node >= 18, no npm dependencies.
 // Claude Code itself is a Node program, so a machine that runs Claude Code can run this file.
 //
 // session-start : injects the completion protocol into Claude's context (the user never has to ask).
@@ -13,9 +13,13 @@
 //   kind "other" (document, research, design ...): there is no objective test, so it is never "succeeded":
 //       every listed deliverable exists and is non-empty -> task_completed_unverified (verification: "deliverables_exist")
 //       a listed deliverable is missing              -> block once, then task_failed
-// link          : node sync_hook.js link <receiver_url> <pairing_token>  (stored in ~/.config/sync-notify, mode 600)
 // pre-tool      : auto-approves Claude's Write of .sync/complete.json (and nothing else)
-// status        : prints the link state (never the token)
+// Customer commands (run by the plugin's slash commands, no keys to copy):
+//   link    : starts pairing, prints a link + temporary code; the phone page finishes it, the plugin
+//             collects its device token automatically (status/stop/session-start) -> ~/.config/sync-notify (0600)
+//   status | pause | resume | unlink
+// Every event goes to a local outbox first and leaves it only when the service accepted it (no event is lost
+// when offline, not yet linked or rate-limited); the service de-duplicates by event_id.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -34,6 +38,10 @@ const PROTOCOL =
   'Do not write it for questions, chat or unfinished work. A separate check decides what notification is sent.';
 
 const USER_DIR = process.env.SYNC_NOTIFY_HOME || path.join(os.homedir(), '.config', 'sync-notify');
+const CFG_FILE = path.join(USER_DIR, 'config.json');
+const OUTBOX = path.join(USER_DIR, 'outbox');
+// Stage A: there is no public Sync service yet; SYNC_SERVER points at the local prototype service.
+const DEFAULT_SERVER = null;
 
 function readJSON(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
 function sh(cmd, cwd, timeoutMs) {
@@ -74,24 +82,57 @@ function log(root, rec) {
   fs.appendFileSync(path.join(root, '.sync', 'events.log'), JSON.stringify({ t: new Date().toISOString(), ...rec }) + '\n');
 }
 
-async function send(root, cfg, event) {
-  const url = process.env.SYNC_RECEIVER_URL || cfg.receiver_url;
-  const token = process.env.SYNC_TOKEN || cfg.token;
-  const sentDir = path.join(root, '.sync', 'sent');
-  fs.mkdirSync(sentDir, { recursive: true });
-  const marker = path.join(sentDir, event.event_id);
-  if (fs.existsSync(marker)) { log(root, { skip: 'duplicate', ...event }); return; }   // exactly once per claim
-  let status = 'not_linked';
-  if (url) {
-    try {
-      const headers = { 'Content-Type': 'application/json', 'Idempotency-Key': event.event_id };
-      if (token) headers.Authorization = `Bearer ${token}`;
-      const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(event), signal: AbortSignal.timeout(15000) });
-      status = `http ${r.status}`;
-    } catch (e) { status = `send error ${e.name}${e.cause && e.cause.code ? ' ' + e.cause.code : ''}`; }   // never break the session
+function userCfg() { return readJSON(CFG_FILE) || {}; }
+function saveUserCfg(c) {
+  fs.mkdirSync(USER_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(CFG_FILE, JSON.stringify(c, null, 2), { mode: 0o600 }); fs.chmodSync(CFG_FILE, 0o600);
+}
+function serverOf(c) { return process.env.SYNC_SERVER || c.server || DEFAULT_SERVER; }
+async function api(server, method, p, body, token) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (body && body.event_id) headers['Idempotency-Key'] = body.event_id;
+  const r = await fetch(server + p, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15000) });
+  let d = {}; try { d = await r.json(); } catch {}
+  return { status: r.status, d };
+}
+
+// Collects the device token once the customer confirmed the phone on the pairing page.
+async function completePairing(c) {
+  if (c.token || !c.pending) return c;
+  if (c.pending.expires_at < Date.now() / 1000) { delete c.pending; saveUserCfg(c); return c; }
+  try {
+    const r = await api(c.pending.server, 'POST', '/v1/pair/poll', { device_code: c.pending.device_code });
+    if (r.d.status === 'approved') { c = { server: c.pending.server, token: r.d.token, phone_masked: r.d.phone_masked, linked_at: Date.now() }; saveUserCfg(c); }
+    else if (r.status === 400) { delete c.pending; saveUserCfg(c); }
+  } catch { /* offline: try again later */ }
+  return c;
+}
+
+async function flushOutbox() {
+  let c = await completePairing(userCfg());
+  let files = []; try { files = fs.readdirSync(OUTBOX).filter((f) => f.endsWith('.json')).sort(); } catch {}
+  if (!files.length) return { sent: 0, queued: 0 };
+  if (!c.token) return { sent: 0, queued: files.length, reason: 'not_linked' };
+  let sent = 0;
+  for (const f of files) {
+    const fp = path.join(OUTBOX, f); const ev = readJSON(fp);
+    if (!ev) { fs.rmSync(fp, { force: true }); continue; }
+    let r; try { r = await api(serverOf(c), 'POST', '/v1/events', ev, c.token); } catch (e) { return { sent, queued: files.length - sent, reason: 'offline' }; }
+    if (r.status >= 200 && r.status < 300) { fs.rmSync(fp, { force: true }); sent++; }   // accepted or duplicate
+    else if (r.status === 400) { fs.renameSync(fp, fp + '.rejected'); }                    // malformed: keep for inspection
+    else return { sent, queued: files.length - sent, reason: `http ${r.status}` };          // 401/429/5xx: keep, retry later
   }
-  fs.writeFileSync(marker, status);
-  log(root, { sent: status, ...event });
+  return { sent, queued: files.length - sent };
+}
+
+async function send(root, cfg, event) {
+  fs.mkdirSync(OUTBOX, { recursive: true, mode: 0o700 });
+  const f = path.join(OUTBOX, `${String(Date.now()).padStart(14, '0')}-${event.event_id}.json`);
+  if (fs.readdirSync(OUTBOX).some((x) => x.includes(event.event_id))) { log(root, { skip: 'duplicate', ...event }); return; }
+  fs.writeFileSync(f, JSON.stringify(event), { mode: 0o600 });
+  const r = await flushOutbox();
+  log(root, { sent: r.reason ? `queued (${r.reason})` : 'delivered', outbox_left: r.queued, ...event });
 }
 
 // PreToolUse: approve ONLY Claude's own completion claim, so the customer is never asked for permission
@@ -163,34 +204,62 @@ async function stop(inp, root) {
   fs.rmSync(claimFile, { force: true });   // the next task needs a new claim
 }
 
-function link(url, token) {
-  if (!/^https:\/\//.test(url || '') && !/^http:\/\/127\.0\.0\.1[:/]/.test(url || '')) {
-    console.error('receiver URL must start with https://'); process.exit(2);
+async function command(mode) {
+  let c = userCfg();
+  if (mode === 'link') {
+    const server = serverOf(c);
+    if (!server) { console.log('Sync service is not available yet (prototype). Nothing was changed.'); return; }
+    if (c.token) { console.log(`Already linked to ${c.phone_masked}. To change the phone run /sync-notify:unlink first.`); return; }
+    const r = await api(server, 'POST', '/v1/pair/start', { device_name: os.hostname().slice(0, 40) });
+    if (r.status !== 200) { console.log(`Could not start linking (http ${r.status}). Try again in a few minutes.`); return; }
+    c.pending = { server, device_code: r.d.device_code, user_code: r.d.user_code, expires_at: Math.floor(Date.now() / 1000) + r.d.expires_in };
+    saveUserCfg(c);
+    console.log(['Open this link on your phone to link it to Sync call notifications:', '', `   ${r.d.verification_uri_complete}`, '',
+      `Linking code: ${r.d.user_code}  (valid ${Math.round(r.d.expires_in / 60)} minutes)`,
+      'Enter your phone number there and the 4-digit code from the verification call. Linking then completes by itself;',
+      'nothing else to do here. Check any time with /sync-notify:status.'].join('\n'));
+    return;
   }
-  fs.mkdirSync(USER_DIR, { recursive: true, mode: 0o700 });
-  const f = path.join(USER_DIR, 'config.json');
-  fs.writeFileSync(f, JSON.stringify({ receiver_url: url, token: token || undefined }, null, 2), { mode: 0o600 });
-  fs.chmodSync(f, 0o600);
-  console.log(`linked: ${new URL(url).host} (token ${token ? 'saved' : 'none'})`);
+  c = await completePairing(c);
+  if (!c.token) {
+    console.log(c.pending ? `Waiting for you to confirm your phone on the linking page (code ${c.pending.user_code}).` : 'Not linked. Run /sync-notify:link to link your phone.');
+    return;
+  }
+  const server = serverOf(c);
+  if (mode === 'status') {
+    const f = await flushOutbox();
+    const r = await api(server, 'GET', '/v1/device/status', null, c.token);
+    if (r.status === 401) { console.log('This link was removed. Run /sync-notify:link to link again.'); return; }
+    const by = {}; for (const e of r.d.events || []) by[e.type] = (by[e.type] || 0) + e.n;
+    console.log([`Linked to phone ${r.d.phone_masked}${r.d.mock ? ' (TEST service, mock calls)' : ''}.`,
+      `Notifications: ${r.d.paused ? 'PAUSED (run /sync-notify:resume)' : 'on'}.`,
+      `Events received: ${Object.entries(by).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}; notification calls: ${r.d.notification_calls}.`,
+      `Waiting in local outbox: ${f.queued}.`].join('\n'));
+  } else if (mode === 'pause' || mode === 'resume') {
+    const r = await api(server, 'POST', `/v1/device/${mode}`, null, c.token);
+    console.log(r.status === 200 ? (mode === 'pause' ? 'Call notifications paused. Task events are still recorded.' : 'Call notifications resumed.') : `Failed (http ${r.status}).`);
+  } else if (mode === 'unlink') {
+    const r = await api(server, 'POST', '/v1/device/unlink', null, c.token);
+    if (r.status === 200 || r.status === 401) {
+      saveUserCfg({}); fs.rmSync(OUTBOX, { recursive: true, force: true });
+      console.log('Unlinked. This computer can no longer send notifications; its key was revoked and deleted.');
+    } else console.log(`Unlink failed (http ${r.status}). Nothing was deleted; try again.`);
+  }
 }
 
 async function main() {
   const mode = process.argv[2] || '';
-  if (mode === 'link') return link(process.argv[3], process.argv[4]);
-  if (mode === 'status') {
-    const c = readJSON(path.join(USER_DIR, 'config.json'));
-    console.log(c && c.receiver_url ? `linked to ${new URL(c.receiver_url).host}, token ${c.token ? 'set' : 'missing'}` : 'not linked');
-    return;
-  }
-  let raw = ''; try { raw = fs.readFileSync(0, 'utf8'); } catch {}
+  const isCommand = ['link', 'status', 'pause', 'resume', 'unlink'].includes(mode);
+  let raw = ''; if (!isCommand) { try { raw = fs.readFileSync(0, 'utf8'); } catch {} }
   // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY=1 (Node >= 22.21 / 24).
   // Behind a proxy (corporate networks, Claude cloud sessions) re-run once with it set.
   const proxied = process.env.HTTPS_PROXY || process.env.https_proxy;
-  if (mode === 'stop' && proxied && !process.env.NODE_USE_ENV_PROXY) {
+  if ((mode === 'stop' || isCommand) && proxied && !process.env.NODE_USE_ENV_PROXY) {
     const r = spawnSync(process.execPath, process.argv.slice(1), { input: raw, stdio: ['pipe', 'inherit', 'inherit'],
       env: { ...process.env, NODE_USE_ENV_PROXY: '1' } });
     process.exit(r.status === null ? 0 : r.status);
   }
+  if (isCommand) return command(mode);
   let inp = {}; try { inp = JSON.parse(raw || '{}'); } catch {}
   const root = process.env.CLAUDE_PROJECT_DIR || inp.cwd || process.cwd();
   if (mode === 'session-start') {

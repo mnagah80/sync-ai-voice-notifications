@@ -1,6 +1,6 @@
 {
   "name": "sync-notify",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sync AI Voice Notifications (prototype): sends a task-completion event automatically when Claude finishes a task AND the project's own check passes. No calls yet.",
   "author": {"name": "Sync"}
 }

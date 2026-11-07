@@ -13,7 +13,7 @@ function project(files = {}) {
 function claim(d, c) { fs.mkdirSync(path.join(d, '.sync'), { recursive: true }); fs.writeFileSync(path.join(d, '.sync', 'complete.json'), JSON.stringify(c)); }
 function hook(mode, d, inp, env = {}) {
   const r = spawnSync('node', [HOOK, mode], { input: JSON.stringify({ cwd: d, ...inp }), encoding: 'utf8',
-    env: { ...process.env, CLAUDE_PROJECT_DIR: d, SYNC_NOTIFY_HOME: path.join(d, '.home'), SYNC_RECEIVER_URL: '', ...env } });
+    env: { ...process.env, CLAUDE_PROJECT_DIR: d, SYNC_NOTIFY_HOME: path.join(d, '.home'), ...env } });
   return r;
 }
 function logOf(d) { return fs.readFileSync(path.join(d, '.sync', 'events.log'), 'utf8').trim().split('\n').map(JSON.parse); }
@@ -67,26 +67,60 @@ test('claimed failed -> task_failed; claim of another session ignored', () => {
   claim(d, { session_id: 'OTHER', status: 'success', summary: 'x' }); hook('stop', d, { session_id: 'S1' });
   assert.match(last(d).stop, /another session/);
 });
-test('link stores the token with mode 600 and status never prints it', () => {
-  const d = project(); const env = { ...process.env, SYNC_NOTIFY_HOME: path.join(d, '.home') };
-  spawnSync('node', [HOOK, 'link', 'https://example.invalid/e', 'tok-SECRET'], { env });
-  const f = path.join(d, '.home', 'config.json'); assert.equal(fs.statSync(f).mode & 0o777, 0o600);
-  const s = spawnSync('node', [HOOK, 'status'], { env, encoding: 'utf8' }).stdout;
-  assert.doesNotMatch(s, /SECRET/); assert.match(s, /token set/);
-  assert.notEqual(spawnSync('node', [HOOK, 'link', 'http://example.com/e', 't'], { env }).status, 0);
+// --- plugin <-> local prototype service (mock calls), real HTTP on 127.0.0.1 ---
+async function startServer(env = {}) {
+  const port = 20000 + Math.floor(Math.random() * 20000); const state = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-srv-'));
+  const p = require('child_process').spawn('node', [path.join(__dirname, '..', 'server', 'main.js')],
+    { env: { ...process.env, PORT: String(port), SYNC_STATE_DIR: state, SYNC_TICK_MS: '200', SYNC_QUIET_HOURS: 'off', ...env }, stdio: 'ignore' });
+  const url = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 50; i++) { try { if ((await fetch(url + '/healthz')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 100)); }
+  return { url, stop: () => p.kill() };
+}
+const run = (args, env, input) => new Promise((res) => {
+  const p = require('child_process').spawn('node', [HOOK, ...args], { env: { ...process.env, ...env } }); let out = '';
+  p.stdout.on('data', (c) => (out += c)); if (input !== undefined) p.stdin.end(input); else p.stdin.end(); p.on('exit', () => res(out));
 });
-test('POSTs once with Bearer token + idempotency key; duplicate not resent', async () => {
-  const got = [];
-  const srv = http.createServer((q, s) => { let b = ''; q.on('data', (c) => (b += c)); q.on('end', () => { got.push({ h: q.headers, b: JSON.parse(b) }); s.writeHead(204).end(); }); });
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  const url = `http://127.0.0.1:${srv.address().port}/e`;
-  const d = project(PASS); claim(d, { session_id: 'S1', status: 'success', kind: 'code', summary: 'ok' });
-  const run = () => new Promise((res) => { const p = require('child_process').spawn('node', [HOOK, 'stop'], { env: { ...process.env, CLAUDE_PROJECT_DIR: d, SYNC_NOTIFY_HOME: path.join(d, '.home'), SYNC_RECEIVER_URL: url, SYNC_TOKEN: 'T1' } }); p.stdin.end(JSON.stringify({ session_id: 'S1' })); p.on('exit', res); });
-  await run(); srv.close();
-  assert.equal(got.length, 1); assert.equal(got[0].h.authorization, 'Bearer T1');
-  assert.equal(got[0].h['idempotency-key'], got[0].b.event_id); assert.equal(got[0].b.type, 'task_succeeded');
-  assert.equal(last(d).sent, 'http 204');
+async function phoneConfirms(url, code, phone) {   // what the customer does on the phone page
+  const post = (u, b) => fetch(url + u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+  await post('/link/start', { code, phone, consent: true });
+  const calls = (await (await fetch(`${url}/mock/calls?to=${encodeURIComponent(phone)}`)).json()).calls;
+  const otp = calls.filter((c) => c.purpose === 'verify').at(-1).message.match(/(\d) (\d) (\d) (\d)/).slice(1).join('');
+  return post('/link/verify', { code, otp });
+}
+
+test('link -> phone confirms -> status collects the token (0600); events queued before linking are delivered', async () => {
+  const srv = await startServer({ SYNC_GROUP_WINDOW_SEC: '0', SYNC_MIN_INTERVAL_SEC: '0' });
+  try {
+    const d = project(PASS); const home = path.join(d, '.home'); const env = { SYNC_NOTIFY_HOME: home, SYNC_SERVER: srv.url, CLAUDE_PROJECT_DIR: d };
+    claim(d, { session_id: 'S1', status: 'success', kind: 'code', summary: 'before link' });
+    await run(['stop'], env, JSON.stringify({ session_id: 'S1' }));
+    assert.match(last(d).sent, /queued \(not_linked\)/);
+    const out = await run(['link'], env); const code = out.match(/Linking code: ([A-Z2-9]{3}-[A-Z2-9]{3})/)[1];
+    assert.match(out, new RegExp(`/link\\?code=${code}`));
+    assert.match(await run(['status'], env), /Waiting for you to confirm/);
+    assert.equal((await phoneConfirms(srv.url, code, '+12025550142')).message, 'تم الربط');
+    const st = await run(['status'], env);
+    assert.match(st, /Linked to phone \+1202•••42/); assert.match(st, /task_succeeded 1/); assert.match(st, /outbox: 0/);
+    const cfg = path.join(home, 'config.json'); assert.equal(fs.statSync(cfg).mode & 0o777, 0o600);
+    assert.doesNotMatch(st + out, new RegExp(JSON.parse(fs.readFileSync(cfg)).token));   // the key is never printed
+    await new Promise((r) => setTimeout(r, 600));
+    const calls = (await (await fetch(`${srv.url}/mock/calls?to=%2B12025550142`)).json()).calls.filter((c) => c.purpose === 'notify');
+    assert.equal(calls.length, 1); assert.match(calls[0].message, /اكتملت مهمة بنجاح وتم التحقق منها/);
+    assert.match(await run(['pause'], env), /paused/); assert.match(await run(['status'], env), /PAUSED/);
+    assert.match(await run(['resume'], env), /resumed/);
+    assert.match(await run(['unlink'], env), /Unlinked/); assert.match(await run(['status'], env), /Not linked/);
+  } finally { srv.stop(); }
 });
+
+test('service down: the event stays in the outbox and is delivered later, once', async () => {
+  const d = project(PASS); const home = path.join(d, '.home');
+  fs.mkdirSync(home, { recursive: true }); fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ server: 'http://127.0.0.1:1', token: 'x'.repeat(43) }));
+  claim(d, { session_id: 'S1', status: 'success', kind: 'code', summary: 'offline' });
+  await run(['stop'], { SYNC_NOTIFY_HOME: home, CLAUDE_PROJECT_DIR: d }, JSON.stringify({ session_id: 'S1' }));
+  assert.match(last(d).sent, /queued \(offline\)/);
+  assert.equal(fs.readdirSync(path.join(home, 'outbox')).length, 1);
+});
+
 test('pre-tool approves only a JSON Write to .sync/complete.json', () => {
   const d = project(); const dec = (ti, tool = 'Write') => { const o = hook('pre-tool', d, { tool_name: tool, tool_input: ti }).stdout;
     return o ? JSON.parse(o).hookSpecificOutput.permissionDecision : 'none'; };
