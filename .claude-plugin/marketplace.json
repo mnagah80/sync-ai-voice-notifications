@@ -1,0 +1,6 @@
+{
+  "name": "sync",
+  "owner": {"name": "Sync"},
+  "plugins": [{"name": "sync-notify", "source": "./plugin/sync-notify",
+               "description": "Automatic task-completion events for Claude Code (prototype, no calls)."}]
+}
